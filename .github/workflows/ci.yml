@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+defaults:
+  run:
+    working-directory: obs-nvidia-notify
+
+jobs:
+  core:
+    name: Core tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DOBSN_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  obs-script:
+    name: OBS script tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.6 is what OBS links against on Windows and is the floor this script targets; the
+        # newer one is here so a change that only works on the old one is caught too.
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tests
+        run: python -m unittest discover -s obs-script/tests -v
+      - name: Check the 3.6 floor
+        # The script must not have picked up syntax OBS's own Python cannot parse. This checks
+        # the grammar rather than running it, which is what a 3.6 target can be checked for on
+        # a runner that no longer ships 3.6.
+        run: |
+          python - <<'PY'
+          import ast, sys
+          source = open("obs-script/obs_nvidia_notify.py").read()
+          tree = ast.parse(source)
+          problems = []
+          for node in ast.walk(tree):
+              if isinstance(node, ast.NamedExpr):
+                  problems.append("walrus operator (3.8+) at line %d" % node.lineno)
+              if isinstance(node, ast.AnnAssign) and isinstance(node.annotation, ast.Subscript):
+                  target = node.annotation.value
+                  if isinstance(target, ast.Name) and target.id in ("list", "dict", "set", "tuple"):
+                      problems.append("builtin generic (3.9+) at line %d" % node.lineno)
+              if isinstance(node, ast.ImportFrom) and node.module == "dataclasses":
+                  problems.append("dataclasses (3.7+) at line %d" % node.lineno)
+          if problems:
+              sys.stderr.write("\n".join(problems) + "\n")
+              sys.exit(1)
+          print("no syntax newer than Python 3.6 found")
+          PY
+
+  cross-language:
+    name: The two ends agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the overlay client
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOBSN_BUILD_TESTS=OFF
+          cmake --build build -j --target obsn_config
+      - name: Run the real OBS script against the real overlay client
+        run: scripts/cross-language-check.sh
+
+  windows-sources:
+    name: Windows sources cross-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Fetch pinned dependencies
+        run: scripts/fetch-deps.sh
+      - name: Cross-compile the Windows-only sources
+        run: scripts/check-windows-sources.sh
+
+  tooling:
+    name: Tooling tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # The parity tests compare against the real C++ loader, so build it first; without this
+      # they would skip and the two implementations could drift unnoticed.
+      - name: Build the C++ config tool
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOBSN_BUILD_TESTS=OFF
+          cmake --build build -j --target obsn_config
+      - name: Install
+        working-directory: obs-nvidia-notify/tools/obsn-cli
+        run: npm install
+      - name: Typecheck
+        working-directory: obs-nvidia-notify/tools/obsn-cli
+        run: npm run typecheck
+      - name: Test
+        working-directory: obs-nvidia-notify/tools/obsn-cli
+        run: npm test
+
+  examples:
+    name: Example profiles validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the config tool
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOBSN_BUILD_TESTS=OFF
+          cmake --build build -j --target obsn_config
+      - name: Validate every shipped profile
+        run: ./build/tools/config-tool/obsn-config validate examples/profiles/*.json
+
+  windows:
+    name: Windows build (authoritative)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned dependencies
+        shell: pwsh
+        run: scripts/fetch-deps.ps1
+      - name: Configure
+        run: >
+          cmake -S . -B build -A x64
+          -DOBSN_BUILD_ADDON=ON -DOBSN_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --config Release -j
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Stage the distribution
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/addon, dist/obs-script, dist/profiles, dist/fonts | Out-Null
+          Copy-Item build/reshade-integration/Release/*.addon64 dist/addon/
+          Copy-Item obs-script/obs_nvidia_notify.py dist/obs-script/
+          Copy-Item examples/profiles/*.json dist/profiles/
+          if (Test-Path assets/fonts/*) { Copy-Item assets/fonts/* dist/fonts/ }
+          Copy-Item docs/installation.md, docs/troubleshooting.md, LICENSE dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obs-nvidia-notify-windows-x64
+          path: obs-nvidia-notify/dist/
