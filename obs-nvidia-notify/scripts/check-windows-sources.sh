@@ -18,6 +18,13 @@
 # diagnostics originating in our own file separately and ignores that one.
 set -uo pipefail
 
+# Every check below matches against GCC's diagnostic text, and GCC quotes identifiers according
+# to the locale: 'NAME' under C/POSIX, but ‘NAME’ under a UTF-8 locale. A filter written against
+# one runs green on a developer's machine and red in CI, for a reason that has nothing to do
+# with the code. Pinning the locale makes the output deterministic; the patterns below also
+# avoid quote characters, so they keep working if this line is ever removed.
+export LC_ALL=C
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CXX="${MINGW_CXX:-x86_64-w64-mingw32-g++}"
 
@@ -99,15 +106,17 @@ done
 #
 #  * `extern "C" __declspec(dllexport) const char* NAME = "..."` is the declaration form ReShade
 #    requires of every add-on; without it the add-on has no name in ReShade's list. GCC warns
-#    that an extern is initialised at its declaration. MSVC does not, and changing it to satisfy
-#    GCC would break the thing it exists to do.
+#    that an extern is initialised at its declaration. MSVC does not -- the Windows job compiles
+#    this file clean under /W4 /WX, which is what establishes that this warning is a GCC-ism
+#    about a required form rather than a defect -- and changing it to satisfy GCC would break
+#    the thing it exists to do.
 #
 # Everything else originating in addon.cpp counts, warning or error.
 printf '%-44s ' "reshade-integration/src/addon.cpp"
 output="$("$CXX" "${FLAGS[@]}" "${INCLUDES[@]}" "reshade-integration/src/addon.cpp" 2>&1)"
 ours="$(echo "$output" \
   | grep -E '^reshade-integration/src/addon\.cpp:[0-9]+:[0-9]+: (error|warning):' \
-  | grep -v "initialized and declared 'extern'" || true)"
+  | grep -v 'initialized and declared .extern.' || true)"
 if [[ -n "$ours" ]]; then
   echo "FAIL"
   echo "$ours"
