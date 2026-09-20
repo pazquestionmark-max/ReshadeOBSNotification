@@ -39,7 +39,7 @@ if (-not (Test-Path (Join-Path $imgui ".git"))) {
 }
 
 Write-Host ""
-Write-Host "Dependencies are in $vendor:"
+Write-Host "Dependencies are in ${vendor}:"
 Write-Host "  ReShade SDK   $ReshadeTag"
 Write-Host "  Dear ImGui    $ImguiTag"
 Write-Host ""
