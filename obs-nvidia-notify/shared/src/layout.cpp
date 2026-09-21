@@ -187,6 +187,48 @@ MotionOffset motion_offset(const Motion& motion, Anchor anchor, const Rect& box,
     return out;
 }
 
+ToastFrame toast_frame(const NotificationsConfig& nc, const Viewport& viewport, float scale,
+                       float stack_height) noexcept {
+    ToastFrame frame;
+    frame.screen_cap = std::max(96.0f, viewport.width - 16.0f);
+
+    // The anchored edge does not depend on the box width -- a right anchor pins the right edge
+    // -- which is what makes it safe to measure the room available before the boxes exist.
+    const Rect reference = resolve_placement(nc.placement, frame.screen_cap, 0.0f, viewport);
+    if (nc.placement.align == Align::Right) {
+        frame.grow_room = reference.right() - 8.0f;
+    } else if (nc.placement.align == Align::Left) {
+        frame.grow_room = viewport.width - reference.x - 8.0f;
+    } else {
+        const float centre = reference.x + reference.w * 0.5f;
+        frame.grow_room = std::min(centre, viewport.width - centre) * 2.0f - 8.0f;
+    }
+    frame.grow_room = std::max(96.0f, std::min(frame.grow_room, frame.screen_cap));
+
+    // A wrapping toast still wraps at the configured width, but never wider than there is room.
+    frame.wrap_cap = std::max(96.0f, std::min(nc.box.max_width * scale, frame.grow_room));
+
+    frame.area = resolve_placement(nc.placement, frame.screen_cap, stack_height, viewport);
+    return frame;
+}
+
+float toast_x(const ToastFrame& frame, Align align, float box_w,
+              const Viewport& viewport) noexcept {
+    float x = frame.area.x;
+    if (align == Align::Right) {
+        x = frame.area.right() - box_w;
+    } else if (align == Align::Center) {
+        x = frame.area.x + (frame.area.w - box_w) * 0.5f;
+    }
+
+    // The last resort. Everything above keeps a toast inside the viewport for any sane
+    // configuration; this is what stops an insane one -- a box wider than the screen, an offset
+    // dragged off the edge -- producing a toast nobody can see.
+    const float rightmost = viewport.width - box_w;
+    if (rightmost < 0.0f) return 0.0f;   // wider than the screen: show its left edge
+    return std::clamp(x, 0.0f, rightmost);
+}
+
 FittedText fit_text(std::string_view text, float max_width, float font_size, OverflowMode mode,
                     float min_font_scale, const MeasureFn& measure, float time_s) {
     FittedText out;

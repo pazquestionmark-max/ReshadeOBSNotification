@@ -262,3 +262,147 @@ TEST(layout, an_armed_replay_buffer_alone_is_opt_in) {
     // No timer: the buffer has no start the user cares about, only a length.
     CHECK(line.text.empty());
 }
+
+// --- toast placement ---------------------------------------------------------------------
+//
+// "The overlay does not understand screen boundaries" is the failure that looks identical to
+// "the overlay is not working": a toast placed off the edge draws nothing anyone can see. These
+// check every anchor, alignment and resolution combination, because the one that is wrong is
+// never the one anybody tried by hand.
+
+namespace {
+
+std::vector<Viewport> every_viewport() {
+    return {
+        {1280.0f, 720.0f},    // still common
+        {1920.0f, 1080.0f},
+        {2560.0f, 1440.0f},
+        {3840.0f, 2160.0f},
+        {5120.0f, 1440.0f},   // ultrawide: the aspect ratio that catches fraction-of-width bugs
+        {3440.0f, 1440.0f},
+        {1080.0f, 1920.0f},   // portrait, because nothing stops someone
+        {800.0f, 600.0f},     // small enough that a default-width toast barely fits
+    };
+}
+
+std::vector<Anchor> every_anchor() {
+    return {Anchor::TopLeft, Anchor::TopCenter, Anchor::TopRight,
+            Anchor::CenterLeft, Anchor::Center, Anchor::CenterRight,
+            Anchor::BottomLeft, Anchor::BottomCenter, Anchor::BottomRight};
+}
+
+}  // namespace
+
+TEST(layout, a_toast_is_never_placed_off_the_screen) {
+    Config config = Config::defaults();
+    for (const Viewport& vp : every_viewport()) {
+        for (const Anchor anchor : every_anchor()) {
+            for (const Align align : {Align::Left, Align::Center, Align::Right}) {
+                config.notifications.placement.anchor = anchor;
+                config.notifications.placement.align = align;
+                const ToastFrame frame = toast_frame(config.notifications, vp, 1.0f, 200.0f);
+
+                // Every width from a stub to wider than the screen.
+                for (const float box_w : {32.0f, 120.0f, 320.0f, 560.0f, 900.0f,
+                                          vp.width * 0.9f, vp.width * 2.0f}) {
+                    const float x = toast_x(frame, align, box_w, vp);
+                    if (x < 0.0f) {
+                        obsn_test::fail(__FILE__, __LINE__,
+                                        "toast starts off the left edge at x=" +
+                                            obsn_test::show(x));
+                    }
+                    // A box wider than the screen cannot fit; it must still start on screen.
+                    if (box_w <= vp.width && x + box_w > vp.width + 0.01f) {
+                        obsn_test::fail(__FILE__, __LINE__,
+                                        "toast runs past the right edge: x=" +
+                                            obsn_test::show(x) + " w=" +
+                                            obsn_test::show(box_w) + " viewport=" +
+                                            obsn_test::show(vp.width));
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(layout, the_grow_room_never_exceeds_the_screen) {
+    Config config = Config::defaults();
+    for (const Viewport& vp : every_viewport()) {
+        for (const Anchor anchor : every_anchor()) {
+            for (const Align align : {Align::Left, Align::Center, Align::Right}) {
+                config.notifications.placement.anchor = anchor;
+                config.notifications.placement.align = align;
+                const ToastFrame frame = toast_frame(config.notifications, vp, 1.0f, 0.0f);
+                CHECK(frame.grow_room <= frame.screen_cap + 0.01f);
+                CHECK(frame.wrap_cap <= frame.grow_room + 0.01f);
+                // A floor, so a tiny viewport still leaves something usable rather than a
+                // zero-width budget that makes every toast vanish.
+                CHECK(frame.grow_room >= 96.0f);
+                CHECK(frame.wrap_cap >= 96.0f);
+            }
+        }
+    }
+}
+
+TEST(layout, a_right_anchored_toast_keeps_its_margin_whatever_its_width) {
+    Config config = Config::defaults();
+    config.notifications.placement.anchor = Anchor::TopRight;
+    config.notifications.placement.align = Align::Right;
+
+    const Viewport vp{1920.0f, 1080.0f};
+    const ToastFrame frame = toast_frame(config.notifications, vp, 1.0f, 100.0f);
+    // The right edge is pinned, so the margin is the same for a narrow toast and a wide one.
+    for (const float box_w : {120.0f, 320.0f, 780.0f}) {
+        CHECK_NEAR(vp.width - (toast_x(frame, Align::Right, box_w, vp) + box_w), 32.0f, 0.01f);
+    }
+}
+
+TEST(layout, a_non_wrapping_toast_may_grow_wider_than_the_wrap_width) {
+    // The reason the two limits are separate: "Recording saved" plus a long file name is one
+    // line, and clipping its ending when there is room beside it is the bug this prevents.
+    Config config = Config::defaults();
+    config.notifications.box.max_width = 300.0f;
+    const Viewport vp{1920.0f, 1080.0f};
+    const ToastFrame frame = toast_frame(config.notifications, vp, 1.0f, 0.0f);
+
+    CHECK_NEAR(frame.wrap_cap, 300.0f, 0.01f);
+    // Anchored 32px from the right edge, so there is nearly the whole screen to grow into.
+    CHECK(frame.grow_room > 1800.0f);
+}
+
+TEST(layout, a_percentage_offset_dragged_off_the_edge_still_lands_on_screen) {
+    Config config = Config::defaults();
+    config.notifications.placement.percent = true;
+    config.notifications.placement.anchor = Anchor::TopLeft;
+    config.notifications.placement.align = Align::Left;
+    config.notifications.placement.x = 1.5f;   // past the right edge
+    config.notifications.placement.y = 0.5f;
+
+    const Viewport vp{1920.0f, 1080.0f};
+    const ToastFrame frame = toast_frame(config.notifications, vp, 1.0f, 100.0f);
+    const float x = toast_x(frame, Align::Left, 320.0f, vp);
+    CHECK(x >= 0.0f);
+    CHECK(x + 320.0f <= vp.width + 0.01f);
+}
+
+TEST(layout, a_toast_wider_than_the_screen_starts_at_the_left_edge) {
+    // It cannot fit, so the only useful thing to do is show its beginning.
+    Config config = Config::defaults();
+    const Viewport vp{800.0f, 600.0f};
+    const ToastFrame frame = toast_frame(config.notifications, vp, 1.0f, 0.0f);
+    CHECK_EQ(toast_x(frame, Align::Right, 2000.0f, vp), 0.0f);
+}
+
+TEST(layout, the_stack_frame_sits_inside_the_viewport_vertically) {
+    Config config = Config::defaults();
+    for (const Viewport& vp : every_viewport()) {
+        for (const Anchor anchor : every_anchor()) {
+            config.notifications.placement.anchor = anchor;
+            const ToastFrame frame = toast_frame(config.notifications, vp, 1.0f, 180.0f);
+            // The stack may be taller than the screen on a small viewport, but its top must
+            // not be so far off that the first toast is invisible.
+            CHECK(frame.area.y < vp.height);
+            CHECK(frame.area.bottom() > 0.0f);
+        }
+    }
+}

@@ -313,6 +313,85 @@ class ServiceTests(unittest.TestCase):
         self.assertIn(script.EV_RECORDING_STARTED, queued)
 
 
+class SelfTestTests(unittest.TestCase):
+    """The regression that shipped broken, locked in.
+
+    A synchronous pipe handle serialises its operations, so a server with a read outstanding
+    cannot write. The overlay speaks once every ten seconds, which means the read is outstanding
+    essentially always and nothing was ever delivered. run_selftest drives exactly that case, on
+    whichever transport the platform uses, so on Windows this covers the real thing.
+    """
+
+    def test_the_self_test_passes(self):
+        endpoint = default_endpoint_for_test("selftest")
+        self.assertEqual(script.run_selftest(endpoint, verbose=False), 0)
+
+    def test_the_server_can_push_to_a_client_that_is_saying_nothing(self):
+        # The same property, asserted directly rather than through the self-test's reporting,
+        # so a failure names this specific behaviour.
+        endpoint = default_endpoint_for_test("idle")
+        service = script.Service()
+        self.assertTrue(service.start(endpoint))
+        try:
+            client = connect_for_test(endpoint)
+            client.write(script.Protocol().encode(
+                script.MSG_CLIENT_HELLO, {"process": "idle.exe"}).encode("utf-8"))
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and service.server.client_count() == 0:
+                time.sleep(0.02)
+            self.assertEqual(service.server.client_count(), 1)
+
+            # Drain the handshake, then go quiet: from here the server has a read outstanding.
+            seen = set()
+            while time.time() < deadline and script.MSG_STATE not in seen:
+                line = client.readline()
+                if not line:
+                    break
+                ok, kind, _, _ = script.Protocol.decode(line.decode("utf-8").strip())
+                if ok:
+                    seen.add(kind)
+            self.assertIn(script.MSG_STATE, seen)
+
+            service.submit(script.EV_RECORDING_STARTED, {})
+            delivered = False
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not delivered:
+                line = client.readline()
+                if not line:
+                    break
+                ok, kind, data, _ = script.Protocol.decode(line.decode("utf-8").strip())
+                if ok and kind == script.MSG_EVENT:
+                    delivered = data.get("kind") == script.EV_RECORDING_STARTED
+            self.assertTrue(delivered,
+                            "the server could not push an event to an idle client")
+            client.close()
+        finally:
+            service.stop()
+
+
+def default_endpoint_for_test(name):
+    return script.default_endpoint("obsn-test-%s-%d" % (name, os.getpid()))
+
+
+def connect_for_test(endpoint):
+    """Opens the endpoint the way the overlay does, on either platform."""
+    deadline = time.time() + 5.0
+    last = None
+    while time.time() < deadline:
+        try:
+            if script.IS_WINDOWS:
+                return open(endpoint, "r+b", buffering=0)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect(endpoint)
+            return sock.makefile("rwb", buffering=0)
+        except (OSError, IOError) as exc:
+            last = exc
+            time.sleep(0.05)
+    raise AssertionError("could not connect to %s: %s" % (endpoint, last))
+
+
 class EndpointTests(unittest.TestCase):
     def test_an_explicit_absolute_endpoint_is_used_as_given(self):
         if script.IS_WINDOWS:

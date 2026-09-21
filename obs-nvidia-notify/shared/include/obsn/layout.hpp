@@ -62,6 +62,30 @@ struct MotionOffset {
 MotionOffset motion_offset(const Motion& motion, Anchor anchor, const Rect& box, float t,
                            bool entering) noexcept;
 
+/// Where the notification stack sits, and how wide a toast inside it may grow.
+///
+/// Extracted from the renderer so it can be checked at every resolution and every anchor in a
+/// test rather than by looking at a screenshot. A toast that lands off the edge of the screen is
+/// indistinguishable from an overlay that is not working, and it is the failure that a viewport
+/// the renderer guessed at produces, so it is worth being able to assert about.
+struct ToastFrame {
+    Rect area;              ///< the stack's frame of reference
+    float screen_cap = 0;   ///< the widest anything may be at this viewport
+    float grow_room = 0;    ///< how far a toast may grow from its anchored edge
+    float wrap_cap = 0;     ///< where a wrapping toast wraps
+};
+
+/// `stack_height` only positions the frame vertically; the widths do not depend on it.
+ToastFrame toast_frame(const NotificationsConfig& notifications, const Viewport& viewport,
+                       float scale, float stack_height) noexcept;
+
+/// The left edge of one toast of width `box_w` inside `frame`.
+///
+/// Clamped into the viewport as a last resort: a configuration that would put a toast off the
+/// edge -- a percentage offset someone dragged too far, a scale that makes the box wider than
+/// the screen -- should produce a toast at the edge rather than one nobody can see.
+float toast_x(const ToastFrame& frame, Align align, float box_w, const Viewport& viewport) noexcept;
+
 struct FittedText {
     std::string text;               ///< possibly truncated, with the ellipsis already appended
     std::vector<std::string> lines; ///< one entry unless the mode is Wrap

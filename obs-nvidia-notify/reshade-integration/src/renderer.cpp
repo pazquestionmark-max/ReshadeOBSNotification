@@ -305,7 +305,18 @@ void Renderer::draw_notifications(ImDrawList* dl, const Config& config, const Vi
     const float line_gap = config.appearance.line_gap * scale;
     const float spacing = nc.spacing * scale;
     const float min_width = nc.width * scale;
-    const float max_width = std::min(box.max_width * scale, std::max(96.0f, viewport.width - 16.0f));
+
+    // Two different limits, because they answer two different questions.
+    //
+    // A toast that does not wrap is bounded only by the screen: "Recording saved" plus a long
+    // file name is one line, and there is no reason to clip its ending when there is room
+    // beside it. A toast that wraps needs a width to wrap *at*, and that is what max_width is
+    // for. Applying the wrap width to both is what silently clips the toasts that matter most.
+    // The widths are resolved by the shared layout, which is checked at every resolution and
+    // every anchor by the test suite rather than by looking at a screenshot.
+    const ToastFrame sizing = toast_frame(nc, viewport, scale, 0.0f);
+    const float grow_room = sizing.grow_room;
+    const float wrap_cap = sizing.wrap_cap;
 
     const bool has_tile = box.accent_style == AccentStyle::Tile ||
                           box.accent_style == AccentStyle::BarAndTile;
@@ -319,7 +330,7 @@ void Renderer::draw_notifications(ImDrawList* dl, const Config& config, const Vi
     // looking like the same design rather than two.
     const float lead_w = has_tile ? tile_w + pad_x
                                   : bar_w + pad_x + (icon_size + icon_gap);
-    const float text_budget = std::max(24.0f, max_width - lead_w - pad_x);
+    const float chrome = lead_w + pad_x;
 
     // Pass one: measure every toast, because their heights differ once a detail line wraps and
     // the stack cannot be positioned until they are known.
@@ -338,6 +349,12 @@ void Renderer::draw_notifications(ImDrawList* dl, const Config& config, const Vi
             t.badge = "x" + std::to_string(notification.repeat_count);
             t.badge_w = measure_text(t.badge, detail_size) + icon_gap;
         }
+
+        // An event line widens instead of wrapping: it is one short sentence and losing its
+        // ending to an ellipsis is worse than a wider box. A message wraps, because someone
+        // else's prose has no length limit. That choice is per category, carried on the toast.
+        const float ceiling = notification.wrap ? wrap_cap : grow_room;
+        const float text_budget = std::max(24.0f, ceiling - chrome);
 
         const float title_wanted = measure_text(notification.title.text, title_size);
         t.title_fits = title_wanted <= text_budget - t.badge_w;
@@ -371,8 +388,8 @@ void Renderer::draw_notifications(ImDrawList* dl, const Config& config, const Vi
         }
 
         const float text_w = std::max(t.title_w + t.badge_w, t.detail_w);
-        const float wanted = lead_w + text_w + pad_x;
-        t.box_w = box.auto_width ? std::clamp(wanted, min_width, max_width) : min_width;
+        const float wanted = chrome + text_w;
+        t.box_w = box.auto_width ? std::clamp(wanted, min_width, ceiling) : min_width;
 
         float text_h = title_size;
         if (!t.detail_lines.empty()) {
@@ -391,7 +408,8 @@ void Renderer::draw_notifications(ImDrawList* dl, const Config& config, const Vi
     // Placement is resolved once against the widest a toast may get. Every anchor puts its own
     // edge at a position that does not depend on the box width -- a right anchor pins the right
     // edge -- so this frame of reference stays correct though each toast is a different size.
-    const Rect area = resolve_placement(nc.placement, max_width, stack_height, viewport);
+    const ToastFrame frame = toast_frame(nc, viewport, scale, stack_height);
+    const Rect area = frame.area;
 
     // Pass two: assign each toast its slot in the stack and let it travel there. The target is
     // recomputed every frame and the toast eases towards it, which is what makes the stack
@@ -405,12 +423,7 @@ void Renderer::draw_notifications(ImDrawList* dl, const Config& config, const Vi
     }
 
     for (const Toast& t : toasts_) {
-        float box_x = area.x;
-        if (nc.placement.align == Align::Right) {
-            box_x = area.right() - t.box_w;
-        } else if (nc.placement.align == Align::Center) {
-            box_x = area.x + (area.w - t.box_w) * 0.5f;
-        }
+        const float box_x = toast_x(frame, nc.placement.align, t.box_w, viewport);
         draw_one_toast(dl, config, t, box_x, area.y + t.item->stack_offset, now_ms);
     }
     stats_.visible_toasts = toasts_.size();

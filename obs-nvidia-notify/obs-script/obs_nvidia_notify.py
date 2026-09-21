@@ -45,7 +45,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only outside OBS
     obs = None
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 65536
 HEARTBEAT_INTERVAL_S = 2.0
@@ -247,7 +247,16 @@ class BaseServer(object):
         raise NotImplementedError
 
     def _close(self, conn):
+        """Begins shutdown of one connection. Safe to call from any thread, and repeatedly."""
         raise NotImplementedError
+
+    def _release(self, conn):
+        """Drops this thread's claim on a connection.
+
+        Only meaningful on Windows, where a handle must not be closed while another thread is
+        still parked on it; the POSIX transport closes the socket outright and overrides this
+        with nothing.
+        """
 
     def _unblock_accept(self):
         raise NotImplementedError
@@ -341,6 +350,7 @@ class BaseServer(object):
                 continue
             if not self._running:
                 self._close(conn)
+                self._release(conn)
                 return
             if self.client_count() >= self.max_clients:
                 # A cap rather than unbounded growth: eight games at once is already
@@ -349,6 +359,7 @@ class BaseServer(object):
                 self.connections_rejected += 1
                 log("refusing a connection: already at %d clients" % self.max_clients)
                 self._close(conn)
+                self._release(conn)
                 continue
 
             session = ClientSession(self._next_id, self.queue_depth)
@@ -376,6 +387,12 @@ class BaseServer(object):
         log("%s disconnected (%s)" % (session.description, why))
 
     def _write_loop(self, session, conn):
+        try:
+            self._write_loop_body(session, conn)
+        finally:
+            self._release(conn)
+
+    def _write_loop_body(self, session, conn):
         while self._running and session.alive:
             try:
                 line = session.queue.get(timeout=0.5)
@@ -391,6 +408,12 @@ class BaseServer(object):
             session.messages_sent += 1
 
     def _read_loop(self, session, conn):
+        try:
+            self._read_loop_body(session, conn)
+        finally:
+            self._release(conn)
+
+    def _read_loop_body(self, session, conn):
         pending = b""
         while self._running and session.alive:
             try:
@@ -502,42 +525,103 @@ class UnixSocketServer(BaseServer):
             pass
 
 
+class _PipeConnection(object):
+    """One accepted pipe, with the events its overlapped operations wait on.
+
+    Reference counted, because a handle must not be closed while another thread is still parked
+    in WaitForMultipleObjects on it. The server holds one claim and each of the two loops holds
+    another; the last one to let go is the one that actually closes.
+    """
+
+    def __init__(self, server, handle):
+        self._server = server
+        self.handle = handle
+        self.read_event = server._create_event()
+        self.write_event = server._create_event()
+        self.stop_event = server._create_event()
+        self._lock = threading.Lock()
+        self._claims = 1
+        self.closing = False
+
+    def acquire(self):
+        with self._lock:
+            if self._claims <= 0:
+                return False
+            self._claims += 1
+            return True
+
+    def begin_close(self):
+        """Wakes anything parked on this connection. Idempotent, safe from any thread."""
+        with self._lock:
+            if self.closing:
+                return
+            self.closing = True
+        self._server._set_event(self.stop_event)
+        self._server._cancel_io(self.handle)
+
+    def release(self):
+        with self._lock:
+            self._claims -= 1
+            if self._claims > 0:
+                return
+        self._server._destroy_connection(self)
+
+
 class WindowsPipeServer(BaseServer):
     """Named pipe listener, built on ctypes so no third-party package is needed.
+
+    **Overlapped I/O throughout, and that is not an optimisation.** A synchronous pipe handle
+    serialises its operations: while a ReadFile is outstanding, a WriteFile on the same handle
+    from another thread blocks behind it rather than running concurrently. Since the overlay
+    only speaks every ten seconds, a synchronous server's read is outstanding essentially all
+    the time -- so every notification it tried to send sat in a blocked WriteFile and was
+    delivered only when the game exited, by which point the write failed with ERROR_NO_DATA
+    because the pipe was closing. The connection looked healthy and nothing ever arrived.
+
+    So this mirrors the overlay's own transport exactly: every operation is overlapped, waits on
+    its own event alongside a per-connection stop event, and is cancelled with CancelIoEx rather
+    than by closing a handle out from under a waiting thread.
 
     One pipe instance is created per accepted connection, which is how several games attach to
     the same name at once. The accept thread always keeps exactly one instance listening.
     """
 
-    # kernel32 constants, spelled out rather than imported from a package we do not have.
     PIPE_ACCESS_DUPLEX = 0x00000003
+    FILE_FLAG_OVERLAPPED = 0x40000000
     FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
     PIPE_TYPE_BYTE = 0x00000000
     PIPE_READMODE_BYTE = 0x00000000
     PIPE_WAIT = 0x00000000
     PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
     PIPE_UNLIMITED_INSTANCES = 255
-    INVALID_HANDLE_VALUE = -1
+    PIPE_BUFFER_BYTES = 64 * 1024
+
     ERROR_PIPE_CONNECTED = 535
     ERROR_BROKEN_PIPE = 109
     ERROR_NO_DATA = 232
+    ERROR_PIPE_NOT_CONNECTED = 233
     ERROR_OPERATION_ABORTED = 995
+    ERROR_IO_PENDING = 997
+
+    WAIT_OBJECT_0 = 0
+    INFINITE = 0xFFFFFFFF
+
     GENERIC_READ = 0x80000000
     GENERIC_WRITE = 0x40000000
     OPEN_EXISTING = 3
-
-    # Only this user and SYSTEM. `P` blocks inherited ACEs, so a permissive ACL somewhere up the
-    # namespace cannot widen this; OW grants to whoever owns the object, which is the creating
-    # user. A remote client is refused outright by the pipe mode flag as well.
-    SDDL = "D:P(A;;GA;;;SY)(A;;GA;;;OW)"
 
     def __init__(self, *args, **kwargs):
         BaseServer.__init__(self, *args, **kwargs)
         self._k32 = None
         self._pending = None
+        self._connect_event = None
+        self._accept_stop_event = None
         self._security = None
+        self._descriptor = None
         self._first_instance = True
+        self._invalid_handle = None
 
+    # --- ctypes plumbing --------------------------------------------------------------------
     def _load(self):
         import ctypes
         from ctypes import wintypes
@@ -549,39 +633,75 @@ class WindowsPipeServer(BaseServer):
         self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._advapi = ctypes.WinDLL("advapi32", use_last_error=True)
 
+        # INVALID_HANDLE_VALUE is (HANDLE)-1, and a HANDLE restype comes back from ctypes as an
+        # *unsigned* integer, so comparing it against Python's -1 never matches and every
+        # failure reads as success. Converting through c_void_p gives the same bit pattern the
+        # API returns, at whatever width this process is.
+        self._invalid_handle = ctypes.c_void_p(-1).value
+
+        class OVERLAPPED(ctypes.Structure):
+            _fields_ = [
+                ("Internal", ctypes.c_void_p),
+                ("InternalHigh", ctypes.c_void_p),
+                ("Offset", wintypes.DWORD),
+                ("OffsetHigh", wintypes.DWORD),
+                ("hEvent", wintypes.HANDLE),
+            ]
+
+        self._OVERLAPPED = OVERLAPPED
+
         # Prototypes are declared explicitly. Letting ctypes guess means a HANDLE is truncated
         # to 32 bits on a 64-bit build, which fails in a way that looks like a permissions
         # problem rather than the type error it is.
-        self._k32.CreateNamedPipeW.restype = wintypes.HANDLE
-        self._k32.CreateNamedPipeW.argtypes = [
+        k32 = self._k32
+        k32.CreateNamedPipeW.restype = wintypes.HANDLE
+        k32.CreateNamedPipeW.argtypes = [
             wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
             wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
         ]
-        self._k32.ConnectNamedPipe.restype = wintypes.BOOL
-        self._k32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
-        self._k32.DisconnectNamedPipe.restype = wintypes.BOOL
-        self._k32.DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
-        self._k32.CloseHandle.restype = wintypes.BOOL
-        self._k32.CloseHandle.argtypes = [wintypes.HANDLE]
-        self._k32.CancelIoEx.restype = wintypes.BOOL
-        self._k32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
-        self._k32.ReadFile.restype = wintypes.BOOL
-        self._k32.ReadFile.argtypes = [
+        k32.ConnectNamedPipe.restype = wintypes.BOOL
+        k32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.DisconnectNamedPipe.restype = wintypes.BOOL
+        k32.DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
+        k32.FlushFileBuffers.restype = wintypes.BOOL
+        k32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CancelIoEx.restype = wintypes.BOOL
+        k32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.ReadFile.restype = wintypes.BOOL
+        k32.ReadFile.argtypes = [
             wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
             ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
         ]
-        self._k32.WriteFile.restype = wintypes.BOOL
-        self._k32.WriteFile.argtypes = [
+        k32.WriteFile.restype = wintypes.BOOL
+        k32.WriteFile.argtypes = [
             wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
             ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
         ]
-        self._k32.CreateFileW.restype = wintypes.HANDLE
-        self._k32.CreateFileW.argtypes = [
+        k32.GetOverlappedResult.restype = wintypes.BOOL
+        k32.GetOverlappedResult.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+        ]
+        k32.CreateEventW.restype = wintypes.HANDLE
+        k32.CreateEventW.argtypes = [
+            ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR,
+        ]
+        k32.SetEvent.restype = wintypes.BOOL
+        k32.SetEvent.argtypes = [wintypes.HANDLE]
+        k32.ResetEvent.restype = wintypes.BOOL
+        k32.ResetEvent.argtypes = [wintypes.HANDLE]
+        k32.WaitForMultipleObjects.restype = wintypes.DWORD
+        k32.WaitForMultipleObjects.argtypes = [
+            wintypes.DWORD, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
+        ]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [
             wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
         ]
-        self._k32.LocalFree.restype = ctypes.c_void_p
-        self._k32.LocalFree.argtypes = [ctypes.c_void_p]
+        k32.LocalFree.restype = ctypes.c_void_p
+        k32.LocalFree.argtypes = [ctypes.c_void_p]
 
         convert = self._advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
         convert.restype = wintypes.BOOL
@@ -590,12 +710,48 @@ class WindowsPipeServer(BaseServer):
             ctypes.POINTER(wintypes.DWORD),
         ]
 
-    def _build_security(self):
-        """Builds a SECURITY_ATTRIBUTES granting only this user and SYSTEM.
+    def _valid(self, handle):
+        return handle is not None and handle != 0 and handle != self._invalid_handle
 
-        Returning None on failure is deliberate and is *not* silent: the pipe is then created
-        with the default DACL, which is still restricted to the creating user's logon session by
-        Windows itself. The log line says which one is in force.
+    def _create_event(self):
+        # Manual reset, initially unsignalled -- the same shape the overlay's own transport uses.
+        handle = self._k32.CreateEventW(None, True, False, None)
+        if not self._valid(handle):
+            raise OSError("CreateEventW failed (error %d)" % self._ctypes.get_last_error())
+        return handle
+
+    def _set_event(self, handle):
+        if self._valid(handle):
+            self._k32.SetEvent(handle)
+
+    def _cancel_io(self, handle):
+        if self._valid(handle):
+            self._k32.CancelIoEx(handle, None)
+
+    def _wait_two(self, first, second):
+        """Waits on two handles, returning 0 for the first, 1 for the second, -1 otherwise."""
+        ctypes = self._ctypes
+        wintypes = self._wintypes
+        array = (wintypes.HANDLE * 2)(first, second)
+        result = self._k32.WaitForMultipleObjects(2, ctypes.byref(array), False, self.INFINITE)
+        if result == self.WAIT_OBJECT_0:
+            return 0
+        if result == self.WAIT_OBJECT_0 + 1:
+            return 1
+        return -1
+
+    def _build_security(self):
+        """Builds a SECURITY_ATTRIBUTES granting this user and SYSTEM read and write.
+
+        The SID is spelled out rather than relying on OWNER_RIGHTS or a protected DACL. An
+        earlier version used `D:P(A;;GA;;;SY)(A;;GA;;;OW)`, which denied the game process: `P`
+        blocks inheritance and OWNER_RIGHTS is not a grant to the current user, so the pipe
+        existed and could not be opened. This is the same descriptor the overlay's own server
+        builds, for the same reason.
+
+        Returning None is not silent: the pipe is then created with the default DACL, which
+        Windows still restricts to the creating logon session, and the log says which is in
+        force.
         """
         import ctypes
         from ctypes import wintypes
@@ -607,29 +763,35 @@ class WindowsPipeServer(BaseServer):
                 ("bInheritHandle", wintypes.BOOL),
             ]
 
+        sid = _current_user_sid()
+        if not sid:
+            log("could not determine this account's SID; the pipe will use the default "
+                "security descriptor, which Windows still restricts to this logon session")
+            return None
+
+        sddl = "D:(A;;GRGW;;;%s)(A;;GRGW;;;SY)" % sid
         descriptor = ctypes.c_void_p()
         size = wintypes.DWORD()
         ok = self._advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            self.SDDL, 1, ctypes.byref(descriptor), ctypes.byref(size)
+            sddl, 1, ctypes.byref(descriptor), ctypes.byref(size)
         )
         if not ok:
             log("could not build the pipe's security descriptor (error %d); falling back to "
                 "the default, which Windows still restricts to this logon session"
                 % ctypes.get_last_error())
             return None
+
         attributes = SECURITY_ATTRIBUTES()
         attributes.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
         attributes.lpSecurityDescriptor = descriptor
         attributes.bInheritHandle = False
-        # The descriptor is kept alive by holding a reference to it alongside the structure;
-        # LocalFree happens in stop().
         self._descriptor = descriptor
         return attributes
 
     def _create_instance(self):
         import ctypes
 
-        flags = self.PIPE_ACCESS_DUPLEX
+        flags = self.PIPE_ACCESS_DUPLEX | self.FILE_FLAG_OVERLAPPED
         if self._first_instance:
             # Refuses to start if something already owns this name, rather than silently
             # becoming a second server nobody will reach.
@@ -641,19 +803,22 @@ class WindowsPipeServer(BaseServer):
             self.PIPE_TYPE_BYTE | self.PIPE_READMODE_BYTE | self.PIPE_WAIT
             | self.PIPE_REJECT_REMOTE_CLIENTS,
             self.PIPE_UNLIMITED_INSTANCES,
-            65536,
-            65536,
+            self.PIPE_BUFFER_BYTES,
+            self.PIPE_BUFFER_BYTES,
             0,
             ctypes.byref(self._security) if self._security is not None else None,
         )
-        if handle == self.INVALID_HANDLE_VALUE or handle is None:
+        if not self._valid(handle):
             raise OSError("CreateNamedPipeW failed (error %d)" % ctypes.get_last_error())
         self._first_instance = False
         return handle
 
+    # --- BaseServer contract ------------------------------------------------------------------
     def _listen(self):
         self._load()
         self._security = self._build_security()
+        self._connect_event = self._create_event()
+        self._accept_stop_event = self._create_event()
         # Created here rather than in the accept loop so a name that is already taken is
         # reported by start() instead of being discovered on a background thread.
         self._pending = self._create_instance()
@@ -670,78 +835,151 @@ class WindowsPipeServer(BaseServer):
                 return None
 
         handle = self._pending
-        ok = self._k32.ConnectNamedPipe(handle, None)
-        error = ctypes.get_last_error()
-        # A client that connected in the window between CreateNamedPipe and ConnectNamedPipe is
-        # reported as an error that means success. Treating it as a failure is a connection
-        # silently lost every time the timing is unlucky.
-        if not ok and error != self.ERROR_PIPE_CONNECTED:
+        overlapped = self._OVERLAPPED()
+        overlapped.hEvent = self._connect_event
+        self._k32.ResetEvent(self._connect_event)
+
+        connected = False
+        if self._k32.ConnectNamedPipe(handle, ctypes.byref(overlapped)):
+            connected = True
+        else:
+            error = ctypes.get_last_error()
+            if error == self.ERROR_PIPE_CONNECTED:
+                # A client that connected in the window between CreateNamedPipe and
+                # ConnectNamedPipe is reported as an error that means success. Treating it as a
+                # failure is a connection silently lost every time the timing is unlucky.
+                connected = True
+            elif error == self.ERROR_IO_PENDING:
+                which = self._wait_two(self._connect_event, self._accept_stop_event)
+                if which == 0:
+                    transferred = self._wintypes.DWORD(0)
+                    connected = bool(self._k32.GetOverlappedResult(
+                        handle, ctypes.byref(overlapped), ctypes.byref(transferred), False))
+                else:
+                    self._k32.CancelIoEx(handle, ctypes.byref(overlapped))
+                    transferred = self._wintypes.DWORD(0)
+                    self._k32.GetOverlappedResult(
+                        handle, ctypes.byref(overlapped), ctypes.byref(transferred), True)
+            elif self._running:
+                log("ConnectNamedPipe failed (error %d)" % error)
+
+        if not connected:
             self._pending = None
             self._k32.CloseHandle(handle)
-            if self._running and error != self.ERROR_OPERATION_ABORTED:
-                log("ConnectNamedPipe failed (error %d)" % error)
             return None
 
         self._pending = None
-        return handle
+        try:
+            return _PipeConnection(self, handle)
+        except OSError as exc:
+            log("could not set up the connection: %s" % exc)
+            self._k32.CloseHandle(handle)
+            return None
 
     def _send(self, conn, data):
         import ctypes
-        from ctypes import wintypes
 
-        written = wintypes.DWORD(0)
-        buffer = ctypes.create_string_buffer(data)
-        ok = self._k32.WriteFile(conn, buffer, len(data), ctypes.byref(written), None)
-        if not ok:
-            raise OSError("WriteFile failed (error %d)" % ctypes.get_last_error())
-        if written.value != len(data):
-            raise OSError("short write: %d of %d bytes" % (written.value, len(data)))
+        sent = 0
+        total = len(data)
+        payload = ctypes.create_string_buffer(data, total)
+        while sent < total:
+            if conn.closing:
+                raise OSError("connection is closing")
+            overlapped = self._OVERLAPPED()
+            overlapped.hEvent = conn.write_event
+            self._k32.ResetEvent(conn.write_event)
+            written = self._wintypes.DWORD(0)
+            view = ctypes.byref(payload, sent)
+
+            if not self._k32.WriteFile(conn.handle, view, total - sent,
+                                       ctypes.byref(written), ctypes.byref(overlapped)):
+                error = ctypes.get_last_error()
+                if error != self.ERROR_IO_PENDING:
+                    raise OSError("WriteFile failed (error %d)" % error)
+                if self._wait_two(conn.write_event, conn.stop_event) != 0:
+                    self._k32.CancelIoEx(conn.handle, ctypes.byref(overlapped))
+                    discarded = self._wintypes.DWORD(0)
+                    self._k32.GetOverlappedResult(
+                        conn.handle, ctypes.byref(overlapped), ctypes.byref(discarded), True)
+                    raise OSError("the connection was closed while writing")
+                if not self._k32.GetOverlappedResult(conn.handle, ctypes.byref(overlapped),
+                                                     ctypes.byref(written), False):
+                    raise OSError("WriteFile failed (error %d)" % ctypes.get_last_error())
+            if written.value == 0:
+                raise OSError("the pipe accepted no bytes")
+            sent += written.value
 
     def _recv(self, conn, size):
         import ctypes
-        from ctypes import wintypes
 
+        if conn.closing:
+            return b""
         buffer = ctypes.create_string_buffer(size)
-        read = wintypes.DWORD(0)
-        ok = self._k32.ReadFile(conn, buffer, size, ctypes.byref(read), None)
-        if not ok:
+        overlapped = self._OVERLAPPED()
+        overlapped.hEvent = conn.read_event
+        self._k32.ResetEvent(conn.read_event)
+        read = self._wintypes.DWORD(0)
+
+        if self._k32.ReadFile(conn.handle, buffer, size, ctypes.byref(read),
+                              ctypes.byref(overlapped)):
+            return buffer.raw[: read.value]
+
+        error = ctypes.get_last_error()
+        if error in (self.ERROR_BROKEN_PIPE, self.ERROR_PIPE_NOT_CONNECTED, self.ERROR_NO_DATA):
+            return b""   # an ordinary disconnect, not a fault
+        if error != self.ERROR_IO_PENDING:
+            raise OSError("ReadFile failed (error %d)" % error)
+
+        if self._wait_two(conn.read_event, conn.stop_event) != 0:
+            self._k32.CancelIoEx(conn.handle, ctypes.byref(overlapped))
+            discarded = self._wintypes.DWORD(0)
+            self._k32.GetOverlappedResult(
+                conn.handle, ctypes.byref(overlapped), ctypes.byref(discarded), True)
+            return b""
+
+        if not self._k32.GetOverlappedResult(conn.handle, ctypes.byref(overlapped),
+                                             ctypes.byref(read), False):
             error = ctypes.get_last_error()
-            if error in (self.ERROR_BROKEN_PIPE, self.ERROR_NO_DATA,
-                         self.ERROR_OPERATION_ABORTED):
-                return b""   # an ordinary disconnect, not a fault
+            if error in (self.ERROR_BROKEN_PIPE, self.ERROR_PIPE_NOT_CONNECTED,
+                         self.ERROR_NO_DATA, self.ERROR_OPERATION_ABORTED):
+                return b""
             raise OSError("ReadFile failed (error %d)" % error)
         return buffer.raw[: read.value]
 
     def _close(self, conn):
-        # CancelIoEx first, so a thread parked in ReadFile on this handle is released before the
-        # handle goes away. Closing a handle out from under a blocked read is the thing that
-        # produces the hangs this avoids.
-        try:
-            self._k32.CancelIoEx(conn, None)
-        except Exception:  # noqa: BLE001
-            pass
-        self._k32.DisconnectNamedPipe(conn)
-        self._k32.CloseHandle(conn)
+        conn.begin_close()
+
+    def _release(self, conn):
+        conn.release()
+
+    def _destroy_connection(self, conn):
+        """The last claim has gone, so the handle is finally safe to close."""
+        if self._valid(conn.handle):
+            self._k32.FlushFileBuffers(conn.handle)
+            self._k32.DisconnectNamedPipe(conn.handle)
+            self._k32.CloseHandle(conn.handle)
+        for event in (conn.read_event, conn.write_event, conn.stop_event):
+            if self._valid(event):
+                self._k32.CloseHandle(event)
+        conn.handle = None
 
     def _unblock_accept(self):
-        import ctypes
-
-        # Connecting to our own pipe releases the accept thread from ConnectNamedPipe. It is the
-        # documented way to do this without switching the whole server to overlapped I/O.
-        handle = self._k32.CreateFileW(
-            self.endpoint, self.GENERIC_READ | self.GENERIC_WRITE, 0, None,
-            self.OPEN_EXISTING, 0, None
-        )
-        if handle != self.INVALID_HANDLE_VALUE and handle is not None:
-            self._k32.CloseHandle(handle)
+        # The accept thread waits on the connect event *and* this one, so releasing it needs no
+        # connection to our own pipe and cannot race a half-accepted client.
+        self._set_event(self._accept_stop_event)
         if self._pending is not None:
-            self._k32.CancelIoEx(self._pending, None)
+            self._cancel_io(self._pending)
             self._k32.CloseHandle(self._pending)
             self._pending = None
-        if getattr(self, "_descriptor", None) is not None:
+        if self._descriptor is not None:
             self._k32.LocalFree(self._descriptor)
             self._descriptor = None
         self._security = None
+        for attribute in ("_connect_event", "_accept_stop_event"):
+            handle = getattr(self, attribute)
+            if handle is not None and self._valid(handle):
+                self._k32.CloseHandle(handle)
+            setattr(self, attribute, None)
 
 
 def default_endpoint(name=""):
@@ -1592,3 +1830,131 @@ def script_unload():
     except Exception:  # noqa: BLE001
         pass
     _service.stop()
+
+
+# --------------------------------------------------------------------------------------------
+# Self-test
+# --------------------------------------------------------------------------------------------
+
+def run_selftest(endpoint=None, verbose=True):
+    """Proves the pipe works, end to end, with no OBS and no game.
+
+    Run it directly:  python obs_nvidia_notify.py --selftest
+
+    The case it exists for is the one that shipped broken. A synchronous pipe handle serialises
+    its operations, so a server whose read is outstanding cannot write; the overlay speaks once
+    every ten seconds, so the read is outstanding essentially always, and every notification sat
+    undelivered in a blocked WriteFile. The connection looked healthy the whole time.
+
+    So step 3 below is the point of this: the client connects, goes quiet, and the server must
+    still be able to push a message to it. On a synchronous handle that times out. It is checked
+    on whichever transport this platform uses, so it covers the real thing on Windows.
+    """
+    def say(message):
+        if verbose:
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+
+    endpoint = endpoint or default_endpoint("obsn-selftest-%d" % os.getpid())
+    say("endpoint: %s" % endpoint)
+
+    service = Service()
+    service.bridge.state["obs_version"] = "self-test"
+    if not service.start(endpoint):
+        say("FAIL: could not listen. If this says the name is taken, another copy of the "
+            "script is already running.")
+        return 1
+
+    client = None
+    try:
+        # 1. Connect, the way the overlay does.
+        deadline = time.time() + 5.0
+        last_error = None
+        while time.time() < deadline and client is None:
+            try:
+                if IS_WINDOWS:
+                    client = open(endpoint, "r+b", buffering=0)
+                else:
+                    import socket as _socket
+
+                    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                    sock.settimeout(5.0)
+                    sock.connect(endpoint)
+                    client = sock.makefile("rwb", buffering=0)
+            except (OSError, IOError) as exc:
+                last_error = exc
+                time.sleep(0.1)
+        if client is None:
+            say("FAIL: could not connect to the pipe: %s" % last_error)
+            say("      On Windows this is usually the security descriptor. Check the line "
+                "above about the pipe's DACL.")
+            return 1
+        say("  ok  connected")
+
+        # 2. Handshake.
+        client.write(Protocol().encode(MSG_CLIENT_HELLO,
+                                       {"process": "selftest.exe"}).encode("utf-8"))
+        seen = set()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not {MSG_HELLO, MSG_STATE}.issubset(seen):
+            line = client.readline()
+            if not line:
+                break
+            ok, kind, _, _ = Protocol.decode(line.decode("utf-8").strip())
+            if ok:
+                seen.add(kind)
+        if MSG_HELLO not in seen:
+            say("FAIL: no hello came back within five seconds.")
+            return 1
+        say("  ok  handshake")
+        if MSG_STATE not in seen:
+            say("FAIL: the handshake completed but no state snapshot followed.")
+            return 1
+        say("  ok  state snapshot")
+
+        # 3. The regression this file exists for: the client is now silent, so the server has a
+        #    read outstanding on this connection. It must still be able to push to it.
+        service.submit(EV_REPLAY_SAVED, {"path": "Self test.mkv", "replay_seconds": 30})
+        deadline = time.time() + 5.0
+        delivered = False
+        while time.time() < deadline and not delivered:
+            line = client.readline()
+            if not line:
+                break
+            ok, kind, data, _ = Protocol.decode(line.decode("utf-8").strip())
+            if ok and kind == MSG_EVENT and data.get("kind") == EV_REPLAY_SAVED:
+                delivered = True
+        if not delivered:
+            say("FAIL: the server could not push an event to an idle client.")
+            say("      This is the symptom of a synchronous pipe handle: the write is stuck "
+                "behind the outstanding read and arrives only when the client goes away.")
+            return 1
+        say("  ok  event delivered to an idle client")
+
+        say("")
+        say("PASS: the pipe works. If notifications still do not appear in game, the problem "
+            "is on the overlay side -- check ReShade's menu, OBS Notifications, Diagnostics.")
+        return 0
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except (OSError, IOError):
+                pass
+        service.stop()
+
+
+if __name__ == "__main__":
+    # Only ever reached when run directly. OBS imports this module, so it never gets here.
+    if "--selftest" in sys.argv:
+        index = sys.argv.index("--selftest")
+        given = sys.argv[index + 1] if len(sys.argv) > index + 1 else None
+        sys.exit(run_selftest(given))
+    sys.stderr.write(
+        "OBS Notify %s\n"
+        "\n"
+        "This is an OBS script: load it from OBS with Tools -> Scripts -> +.\n"
+        "\n"
+        "  --selftest [endpoint]   check that the pipe works, without OBS or a game\n"
+        % SCRIPT_VERSION)
+    sys.exit(2)

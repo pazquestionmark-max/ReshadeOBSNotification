@@ -1,5 +1,26 @@
 # Troubleshooting
 
+## Start here: prove the pipe works
+
+```
+python obs_nvidia_notify.py --selftest
+```
+
+Run that with the same Python OBS uses. It stands up the server, connects to it, completes the
+handshake and pushes an event, with no OBS and no game involved. It takes about a second and it
+separates the two halves of almost every problem on this page:
+
+* **PASS** -- the pipe is fine, so the problem is on the overlay side. Skip to
+  [Toasts appear but ...](#toasts-appear-but-the-text-is-clipped-or-misaligned) or check
+  ReShade's menu under OBS Notifications, Diagnostics.
+* **could not connect** -- the pipe exists but cannot be opened. On Windows that is the security
+  descriptor; the line above it in the output says which one is in force.
+* **the server could not push an event to an idle client** -- the symptom of a synchronous pipe
+  handle. It is what this check exists for, and it is fixed in 1.0.1; if you see it, you are on
+  an older script.
+
+---
+
 Symptom first. The two places that will tell you what is wrong are OBS's **script log**
 (Tools → Scripts, select the script) and the add-on's **Diagnostics** tab in ReShade's menu.
 
@@ -96,9 +117,22 @@ liked is not lost to one you did not.
 If saving fails, the Profiles tab shows why. The usual cause is that
 `%APPDATA%\OBSNotifyOverlay\` could not be created.
 
+## Nothing appeared, and the script log says `write failed ... error 232`
+
+Error 232 is ERROR_NO_DATA, "the pipe is being closed". Before 1.0.1 this was the *end* of a
+much earlier problem rather than the problem itself: the server used a synchronous pipe handle,
+which serialises its operations, so while its read was outstanding -- essentially always, since
+the overlay only speaks every ten seconds -- every message it tried to send sat in a blocked
+`WriteFile`. The write finally returned, with error 232, when the game exited and the pipe
+started closing. The connection looked healthy the whole time and nothing was ever delivered.
+
+Update the script to 1.0.1 or later and run `--selftest`. If the self-test passes and you still
+see this, it is now the ordinary case it is named for: the game closed.
+
 ## Checking without a game
 
 ```bash
+python obs_nvidia_notify.py --selftest                # prove the pipe, end to end
 obsn-config probe 10                                  # attach as the overlay does
 cd tools/obsn-cli && npx tsx src/cli.ts mock          # pretend to be OBS
 ```

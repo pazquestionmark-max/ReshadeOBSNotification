@@ -33,6 +33,14 @@ If the log says it could not listen, see [troubleshooting.md](troubleshooting.md
 
 ## 3. Check it works
 
+First, prove the pipe on its own -- one second, no game needed:
+
+```
+python obs_nvidia_notify.py --selftest
+```
+
+Use the same Python OBS is pointed at. It should end with `PASS`.
+
 In OBS, with the game running: **Tools → Scripts**, select the script, and press
 **Send a test notification**. A "Replay saved" toast should appear in the game.
 
