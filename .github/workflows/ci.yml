@@ -62,6 +62,23 @@ jobs:
           print("no syntax newer than Python 3.6 found")
           PY
 
+  windows-script:
+    name: OBS script on Windows (the real pipe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      # The job that would have caught the bug this exists for. Everywhere else the script runs
+      # on the POSIX transport, so CreateNamedPipeW, overlapped I/O and the pipe's security
+      # descriptor were never executed by anything -- and a synchronous handle that can never
+      # write while a read is outstanding is invisible to a socket.
+      - name: Tests
+        run: python -m unittest discover -s obs-script/tests -v
+      - name: Self-test against a real named pipe
+        run: python obs-script/obs_nvidia_notify.py --selftest
+
   cross-language:
     name: The two ends agree
     runs-on: ubuntu-latest
