@@ -172,7 +172,13 @@ jobs:
           Copy-Item examples/profiles/*.json dist/profiles/
           if (Test-Path assets/fonts/*) { Copy-Item assets/fonts/* dist/fonts/ }
           Copy-Item docs/installation.md, docs/troubleshooting.md, LICENSE dist/
+          # A file next to the binaries saying exactly what they were built from.
+          "commit:  ${{ github.sha }}`nbranch:  ${{ github.ref_name }}`nbuilt:   $(Get-Date -Format o)" |
+            Out-File -FilePath dist/BUILD.txt -Encoding utf8
+      # The commit is in the artifact's name because "which build is this?" was not
+      # answerable from a downloaded folder, and a stale script that silently does nothing is
+      # indistinguishable from a broken one.
       - uses: actions/upload-artifact@v4
         with:
-          name: obs-nvidia-notify-windows-x64
+          name: obs-nvidia-notify-windows-x64-${{ github.sha }}
           path: obs-nvidia-notify/dist/
